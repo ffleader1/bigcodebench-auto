@@ -56,6 +56,272 @@ func sendNotification(title, message string) {
 	}
 }
 
+// takeScreenshot takes a screenshot and saves it to specified paths
+func takeScreenshot(responseName, responseFolder, taskDir string) error {
+	// Create pictures folder if it doesn't exist
+	picturesFolder := filepath.Join(taskDir, "pictures")
+	if err := os.MkdirAll(picturesFolder, 0755); err != nil {
+		return fmt.Errorf("failed to create pictures folder: %w", err)
+	}
+
+	_ = time.Now().Format("20060102_150405")
+	screenshotName := fmt.Sprintf("%s.png", responseName)
+
+	// Paths for both locations
+	responseScreenshot := filepath.Join(responseFolder, screenshotName)
+	picturesScreenshot := filepath.Join(picturesFolder, screenshotName)
+
+	system := runtime.GOOS
+	var cmd *exec.Cmd
+
+	switch system {
+	case "windows":
+		// Use PowerShell to take DPI-aware full screen screenshot on Windows
+		psScript := fmt.Sprintf(`
+		Add-Type -AssemblyName System.Windows.Forms
+		Add-Type -AssemblyName System.Drawing
+		Add-Type @"
+			using System;
+			using System.Runtime.InteropServices;
+			public class DPI {
+				[DllImport("user32.dll")]
+				public static extern bool SetProcessDPIAware();
+				[DllImport("user32.dll")]
+				public static extern int GetSystemMetrics(int nIndex);
+			}
+"@
+		[DPI]::SetProcessDPIAware()
+		$screenWidth = [DPI]::GetSystemMetrics(0)
+		$screenHeight = [DPI]::GetSystemMetrics(1)
+		$bitmap = New-Object System.Drawing.Bitmap $screenWidth, $screenHeight
+		$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+		$graphics.CopyFromScreen(0, 0, 0, 0, [System.Drawing.Size]::new($screenWidth, $screenHeight))
+		$bitmap.Save('%s')
+		$bitmap.Save('%s')
+		$graphics.Dispose()
+		$bitmap.Dispose()
+	`, responseScreenshot, picturesScreenshot)
+
+		cmd = exec.Command("powershell", "-Command", psScript)
+
+	case "darwin": // macOS
+		// Take full screen screenshot and save to both locations
+		cmd = exec.Command("screencapture", "-x", responseScreenshot)
+		if err := cmd.Run(); err == nil {
+			// Copy to pictures folder
+			copyCmd := exec.Command("cp", responseScreenshot, picturesScreenshot)
+			copyCmd.Run()
+		}
+
+	case "linux":
+		// Try different screenshot tools with full screen options
+		tools := [][]string{
+			{"gnome-screenshot", "-f", responseScreenshot},
+			{"scrot", responseScreenshot},
+			{"import", "-window", "root", responseScreenshot},
+			{"maim", responseScreenshot},
+		}
+
+		var err error
+		for _, tool := range tools {
+			cmd = exec.Command(tool[0], tool[1:]...)
+			if err = cmd.Run(); err == nil {
+				// Copy to pictures folder
+				copyCmd := exec.Command("cp", responseScreenshot, picturesScreenshot)
+				copyCmd.Run()
+				break
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("no screenshot tool available on Linux")
+		}
+
+	default:
+		return fmt.Errorf("screenshot not supported on %s", system)
+	}
+
+	if system == "windows" {
+		return cmd.Run()
+	}
+
+	return nil
+}
+
+// openTerminalAndRunTest opens a terminal and runs the test
+func openTerminalAndRunTest(responseFile, testFile, workDir, responseName string) (TestResult, error) {
+	system := runtime.GOOS
+
+	tempResponse := filepath.Join(workDir, "temp_"+filepath.Base(responseFile))
+	signalFile := filepath.Join(workDir, fmt.Sprintf("screenshot_done_%s.signal", responseName))
+
+	result := TestResult{
+		Name:           responseName,
+		Success:        false,
+		Output:         "",
+		LineCoverage:   0.0,
+		BranchCoverage: 0.0,
+		CoverageReport: "",
+		Cached:         false,
+	}
+
+	// Clean up any leftover signal files at the start
+	if _, err := os.Stat(signalFile); err == nil {
+		os.Remove(signalFile)
+		fmt.Printf("🧹 Cleaned up leftover signal file: %s\n", signalFile)
+	}
+
+	// Copy and modify the response file
+	err := modifyPackageToMain(responseFile, tempResponse)
+	if err != nil {
+		result.Output = fmt.Sprintf("Failed to modify package: %v", err)
+		return result, err
+	}
+
+	// Ensure cleanup
+	defer func() {
+		if _, err := os.Stat(tempResponse); err == nil {
+			os.Remove(tempResponse)
+		}
+		// Clean up coverage files
+		coverageFiles := []string{"coverage.out", "coverage.html"}
+		for _, file := range coverageFiles {
+			if _, err := os.Stat(filepath.Join(workDir, file)); err == nil {
+				os.Remove(filepath.Join(workDir, file))
+			}
+		}
+		// Clean up signal file
+		if _, err := os.Stat(signalFile); err == nil {
+			os.Remove(signalFile)
+		}
+	}()
+
+	// Prepare the test command
+	testCmd := fmt.Sprintf("go test -v %s %s",
+		filepath.Base(testFile),
+		"temp_"+filepath.Base(responseFile))
+
+	var cmd *exec.Cmd
+
+	switch system {
+	case "windows":
+		// Create a batch file that waits for screenshot signal
+		batchContent := fmt.Sprintf(`@echo off
+cd /d "%s"
+echo Testing %s...
+echo.
+%s
+echo.
+echo Test completed. Waiting for screenshot...
+:wait
+if exist "screenshot_done_%s.signal" (
+    del "screenshot_done_%s.signal" 2>nul
+    timeout /t 4 /nobreak > nul
+    echo Screenshot processing complete. Closing window...
+    timeout /t 1 /nobreak > nul
+    exit
+) else (
+    timeout /t 1 /nobreak > nul
+    goto wait
+)
+`, workDir, responseName, testCmd, responseName, responseName)
+
+		batchFile := filepath.Join(workDir, fmt.Sprintf("test_%s.bat", responseName))
+		if err := os.WriteFile(batchFile, []byte(batchContent), 0644); err != nil {
+			return result, err
+		}
+		defer os.Remove(batchFile)
+
+		cmd = exec.Command("cmd", "/c", "start", "cmd", "/c", batchFile)
+
+	case "darwin": // macOS
+		// Create an AppleScript that waits for signal file
+		script := fmt.Sprintf(`
+tell application "Terminal"
+	activate
+	set newTab to do script "cd '%s' && echo 'Testing %s...' && echo '' && %s && echo '' && echo 'Test completed. Waiting for screenshot...' && while [ ! -f 'screenshot_done_%s.signal' ]; do sleep 1; done && echo 'Screenshot taken. Closing window...' && rm -f 'screenshot_done_%s.signal' && sleep 1 && exit"
+end tell
+`, workDir, responseName, testCmd, responseName, responseName)
+
+		cmd = exec.Command("osascript", "-e", script)
+
+	case "linux":
+		// Create a script that waits for signal file
+		waitScript := fmt.Sprintf("cd '%s' && echo 'Testing %s...' && echo '' && %s && echo '' && echo 'Test completed. Waiting for screenshot...' && while [ ! -f 'screenshot_done_%s.signal' ]; do sleep 1; done && echo 'Screenshot taken. Closing window...' && rm -f 'screenshot_done_%s.signal' && sleep 1 && exit", workDir, responseName, testCmd, responseName, responseName)
+
+		terminals := [][]string{
+			{"gnome-terminal", "--", "bash", "-c", waitScript},
+			{"xterm", "-e", fmt.Sprintf("bash -c \"%s\"", waitScript)},
+			{"konsole", "-e", fmt.Sprintf("bash -c \"%s\"", waitScript)},
+		}
+
+		var terminalErr error
+		for _, terminal := range terminals {
+			cmd = exec.Command(terminal[0], terminal[1:]...)
+			if _, terminalErr = exec.LookPath(terminal[0]); terminalErr == nil {
+				break
+			}
+		}
+		if terminalErr != nil {
+			return result, fmt.Errorf("no suitable terminal emulator found")
+		}
+
+	default:
+		return result, fmt.Errorf("unsupported operating system: %s", system)
+	}
+
+	// Start the terminal
+	if err := cmd.Start(); err != nil {
+		return result, fmt.Errorf("failed to start terminal: %w", err)
+	}
+
+	// Run test separately to get result and timing
+	testCmdExec := exec.Command("go", "test", "-v",
+		filepath.Base(testFile),
+		"temp_"+filepath.Base(responseFile))
+	testCmdExec.Dir = workDir
+
+	startTime := time.Now()
+	output, testErr := testCmdExec.CombinedOutput()
+	testDuration := time.Since(startTime)
+
+	// Wait for test to complete and display (test time + small buffer for display)
+	displayWait := testDuration + (1 * time.Second)
+	time.Sleep(displayWait)
+
+	// Take screenshot while terminal is still open
+	fmt.Printf("📸 Taking screenshot for %s...\n", responseName)
+	responseFolder := filepath.Dir(responseFile)
+	if err := takeScreenshot(responseName, responseFolder, workDir); err != nil {
+		fmt.Printf("Warning: Could not take screenshot for %s: %v\n", responseName, err)
+	} else {
+		fmt.Printf("✅ Screenshot saved for %s\n", responseName)
+	}
+
+	// Give Windows extra time to properly render the screenshot before signaling terminal to close
+	// Remove the Windows-specific delay since we've moved it to the batch script
+	// if system == "windows" {
+	//     fmt.Printf("⏳ Giving Windows time to process screenshot...\n")
+	//     time.Sleep(2 * time.Second)
+	// }
+
+	// Signal terminal to close by creating the signal file
+	if err := os.WriteFile(signalFile, []byte("done"), 0644); err != nil {
+		fmt.Printf("Warning: Could not create signal file for %s: %v\n", responseName, err)
+	}
+
+	// Wait a moment for terminal to process the signal and close gracefully
+	time.Sleep(2 * time.Second)
+
+	result.Output = fmt.Sprintf("=== Test Output ===\n%s\n", string(output))
+	if testErr == nil {
+		result.Success = true
+	} else {
+		result.Output += fmt.Sprintf("\nTest Error: %v\n", testErr)
+	}
+
+	return result, nil
+}
+
 // readEnvFile reads the environment file to get TASK_ID
 func readEnvFile(envPath string) (string, error) {
 	file, err := os.Open(envPath)
@@ -302,7 +568,7 @@ func loadCachedResult(responseFolder string) (TestResult, error) {
 }
 
 // runGoTest runs go test for a specific response file
-func runGoTest(responseFile, testFile, workDir string) TestResult {
+func runGoTest(responseFile, testFile, workDir, taskDir string) TestResult {
 	responseFolder := filepath.Dir(responseFile)
 	responseName := filepath.Base(responseFile)
 	responseName = strings.TrimSuffix(responseName, ".go")
@@ -328,75 +594,23 @@ func runGoTest(responseFile, testFile, workDir string) TestResult {
 		}
 	}
 
-	tempResponse := filepath.Join(workDir, "temp_"+filepath.Base(responseFile))
-
-	result := TestResult{
-		Name:           responseName,
-		Success:        false,
-		Output:         "",
-		LineCoverage:   0.0,
-		BranchCoverage: 0.0,
-		CoverageReport: "",
-		Cached:         false,
-	}
-
-	// Copy and modify the response file
-	err = modifyPackageToMain(responseFile, tempResponse)
+	// Open terminal and run test
+	result, err := openTerminalAndRunTest(responseFile, testFile, workDir, responseName)
 	if err != nil {
-		result.Output = fmt.Sprintf("Failed to modify package: %v", err)
+		result.Output = fmt.Sprintf("Failed to run test in terminal: %v", err)
 		return result
 	}
 
-	// Ensure cleanup
-	defer func() {
-		if _, err := os.Stat(tempResponse); err == nil {
-			os.Remove(tempResponse)
-		}
-		// Clean up coverage files
-		coverageFiles := []string{"coverage.out", "coverage.html"}
-		for _, file := range coverageFiles {
-			if _, err := os.Stat(filepath.Join(workDir, file)); err == nil {
-				os.Remove(filepath.Join(workDir, file))
-			}
-		}
-	}()
-
-	var testOutput strings.Builder
-
-	// Run basic test first
-	cmd := exec.Command("go", "test", "-v",
-		filepath.Base(testFile),
-		"temp_"+filepath.Base(responseFile))
-	cmd.Dir = workDir
-
-	done := make(chan error, 1)
-	go func() {
-		output, err := cmd.CombinedOutput()
-		testOutput.WriteString("=== Basic Test Output ===\n")
-		testOutput.WriteString(string(output))
-		testOutput.WriteString("\n")
-
-		if err != nil {
-			testOutput.WriteString(fmt.Sprintf("Test Error: %v\n", err))
-			done <- err
-		} else {
-			result.Success = true
-			done <- nil
-		}
-	}()
-
-	select {
-	case _ = <-done:
-		// Test result handled above
-	case <-time.After(30 * time.Second): // Back to original timeout
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-		testOutput.WriteString("Test timed out after 30 seconds")
+	// Take screenshot after test completes
+	fmt.Printf("📸 Taking screenshot for %s...\n", responseName)
+	if err := takeScreenshot(responseName, responseFolder, taskDir); err != nil {
+		fmt.Printf("Warning: Could not take screenshot for %s: %v\n", responseName, err)
+	} else {
+		fmt.Printf("✅ Screenshot saved for %s\n", responseName)
+		// Signal terminal to close
+		signalFile := filepath.Join(taskDir, fmt.Sprintf("screenshot_done_%s.signal", responseName))
+		os.WriteFile(signalFile, []byte("done"), 0644)
 	}
-
-	result.Output = testOutput.String()
-
 	// Write individual result.txt file
 	resultFile := filepath.Join(responseFolder, "result.txt")
 	if err := os.WriteFile(resultFile, []byte(result.Output), 0644); err != nil {
@@ -536,7 +750,7 @@ func main() {
 		fmt.Printf("Testing %s...\n", responseName)
 		fmt.Printf("%s\n", strings.Repeat("=", 50))
 
-		result := runGoTest(responseFile, testFile, taskDir)
+		result := runGoTest(responseFile, testFile, taskDir, taskDir)
 		results = append(results, result)
 
 		if result.Success {
@@ -551,10 +765,6 @@ func main() {
 		} else {
 			fmt.Printf("❌ %s FAILED\n", responseName)
 		}
-
-		//if !result.Cached {
-		//	fmt.Printf("Output:\n%s\n", result.Output)
-		//}
 	}
 
 	// Write results to file
@@ -588,5 +798,16 @@ func main() {
 			"Testing Complete! 🏆",
 			fmt.Sprintf("%d/%d tests passed for Task %s", passedCount, len(results), taskID),
 		)
+	}
+
+	// Final cleanup: Remove all signal files
+	fmt.Printf("\n🧹 Final cleanup of signal files...\n")
+	signalPattern := filepath.Join(taskDir, "screenshot_done_*.signal")
+	if matches, err := filepath.Glob(signalPattern); err == nil {
+		for _, match := range matches {
+			if err := os.Remove(match); err == nil {
+				fmt.Printf("   Removed: %s\n", filepath.Base(match))
+			}
+		}
 	}
 }
