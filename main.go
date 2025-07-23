@@ -56,20 +56,15 @@ func sendNotification(title, message string) {
 	}
 }
 
-// takeScreenshot takes a screenshot and saves it to specified paths
-func takeScreenshot(responseName, responseFolder, taskDir string) error {
+// takeScreenshot takes a screenshot and saves it to pictures folder only
+func takeScreenshot(screenshotName, taskDir string) error {
 	// Create pictures folder if it doesn't exist
 	picturesFolder := filepath.Join(taskDir, "pictures")
 	if err := os.MkdirAll(picturesFolder, 0755); err != nil {
 		return fmt.Errorf("failed to create pictures folder: %w", err)
 	}
 
-	_ = time.Now().Format("20060102_150405")
-	screenshotName := fmt.Sprintf("%s.png", responseName)
-
-	// Paths for both locations
-	responseScreenshot := filepath.Join(responseFolder, screenshotName)
-	picturesScreenshot := filepath.Join(picturesFolder, screenshotName)
+	screenshotPath := filepath.Join(picturesFolder, screenshotName)
 
 	system := runtime.GOOS
 	var cmd *exec.Cmd
@@ -97,54 +92,41 @@ func takeScreenshot(responseName, responseFolder, taskDir string) error {
 		$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 		$graphics.CopyFromScreen(0, 0, 0, 0, [System.Drawing.Size]::new($screenWidth, $screenHeight))
 		$bitmap.Save('%s')
-		$bitmap.Save('%s')
 		$graphics.Dispose()
 		$bitmap.Dispose()
-	`, responseScreenshot, picturesScreenshot)
+	`, screenshotPath)
 
 		cmd = exec.Command("powershell", "-Command", psScript)
 
 	case "darwin": // macOS
-		// Take full screen screenshot and save to both locations
-		cmd = exec.Command("screencapture", "-x", responseScreenshot)
-		if err := cmd.Run(); err == nil {
-			// Copy to pictures folder
-			copyCmd := exec.Command("cp", responseScreenshot, picturesScreenshot)
-			copyCmd.Run()
-		}
+		cmd = exec.Command("screencapture", "-x", screenshotPath)
 
 	case "linux":
 		// Try different screenshot tools with full screen options
 		tools := [][]string{
-			{"gnome-screenshot", "-f", responseScreenshot},
-			{"scrot", responseScreenshot},
-			{"import", "-window", "root", responseScreenshot},
-			{"maim", responseScreenshot},
+			{"gnome-screenshot", "-f", screenshotPath},
+			{"scrot", screenshotPath},
+			{"import", "-window", "root", screenshotPath},
+			{"maim", screenshotPath},
 		}
 
 		var err error
 		for _, tool := range tools {
 			cmd = exec.Command(tool[0], tool[1:]...)
 			if err = cmd.Run(); err == nil {
-				// Copy to pictures folder
-				copyCmd := exec.Command("cp", responseScreenshot, picturesScreenshot)
-				copyCmd.Run()
 				break
 			}
 		}
 		if err != nil {
 			return fmt.Errorf("no screenshot tool available on Linux")
 		}
+		return nil
 
 	default:
 		return fmt.Errorf("screenshot not supported on %s", system)
 	}
 
-	if system == "windows" {
-		return cmd.Run()
-	}
-
-	return nil
+	return cmd.Run()
 }
 
 // openTerminalAndRunTest opens a terminal and runs the test
@@ -290,19 +272,12 @@ end tell
 
 	// Take screenshot while terminal is still open
 	fmt.Printf("📸 Taking screenshot for %s...\n", responseName)
-	responseFolder := filepath.Dir(responseFile)
-	if err := takeScreenshot(responseName, responseFolder, workDir); err != nil {
+	screenshotName := fmt.Sprintf("%s.png", responseName)
+	if err := takeScreenshot(screenshotName, workDir); err != nil {
 		fmt.Printf("Warning: Could not take screenshot for %s: %v\n", responseName, err)
 	} else {
 		fmt.Printf("✅ Screenshot saved for %s\n", responseName)
 	}
-
-	// Give Windows extra time to properly render the screenshot before signaling terminal to close
-	// Remove the Windows-specific delay since we've moved it to the batch script
-	// if system == "windows" {
-	//     fmt.Printf("⏳ Giving Windows time to process screenshot...\n")
-	//     time.Sleep(2 * time.Second)
-	// }
 
 	// Signal terminal to close by creating the signal file
 	if err := os.WriteFile(signalFile, []byte("done"), 0644); err != nil {
@@ -320,6 +295,141 @@ end tell
 	}
 
 	return result, nil
+}
+
+// openTerminalAndRunMainTest opens a terminal and runs coverage analysis for main.go
+func openTerminalAndRunMainTest(taskDir, testType string) (string, error) {
+	system := runtime.GOOS
+	signalFile := filepath.Join(taskDir, fmt.Sprintf("screenshot_done_%s.signal", testType))
+
+	// Clean up any leftover signal files at the start
+	if _, err := os.Stat(signalFile); err == nil {
+		os.Remove(signalFile)
+		fmt.Printf("🧹 Cleaned up leftover signal file: %s\n", signalFile)
+	}
+
+	var testCmd string
+	if testType == "line_coverage" {
+		testCmd = "go test -coverprofile=coverage.out && go tool cover -html=coverage.out -o coverage.html"
+	} else { // branch_coverage
+		testCmd = "gobco"
+	}
+
+	var cmd *exec.Cmd
+
+	switch system {
+	case "windows":
+		// Create a batch file that waits for screenshot signal
+		batchContent := fmt.Sprintf(`@echo off
+cd /d "%s"
+echo Running %s analysis for main.go...
+echo.
+%s
+echo.
+echo Analysis completed. Waiting for screenshot...
+:wait
+if exist "screenshot_done_%s.signal" (
+    del "screenshot_done_%s.signal" 2>nul
+    timeout /t 4 /nobreak > nul
+    echo Screenshot processing complete. Closing window...
+    timeout /t 1 /nobreak > nul
+    exit
+) else (
+    timeout /t 1 /nobreak > nul
+    goto wait
+)
+`, taskDir, testType, testCmd, testType, testType)
+
+		batchFile := filepath.Join(taskDir, fmt.Sprintf("main_%s.bat", testType))
+		if err := os.WriteFile(batchFile, []byte(batchContent), 0644); err != nil {
+			return "", err
+		}
+		defer os.Remove(batchFile)
+
+		cmd = exec.Command("cmd", "/c", "start", "cmd", "/c", batchFile)
+
+	case "darwin": // macOS
+		// Create an AppleScript that waits for signal file
+		script := fmt.Sprintf(`
+tell application "Terminal"
+	activate
+	set newTab to do script "cd '%s' && echo 'Running %s analysis for main.go...' && echo '' && %s && echo '' && echo 'Analysis completed. Waiting for screenshot...' && while [ ! -f 'screenshot_done_%s.signal' ]; do sleep 1; done && echo 'Screenshot taken. Closing window...' && rm -f 'screenshot_done_%s.signal' && sleep 1 && exit"
+end tell
+`, taskDir, testType, testCmd, testType, testType)
+
+		cmd = exec.Command("osascript", "-e", script)
+
+	case "linux":
+		// Create a script that waits for signal file
+		waitScript := fmt.Sprintf("cd '%s' && echo 'Running %s analysis for main.go...' && echo '' && %s && echo '' && echo 'Analysis completed. Waiting for screenshot...' && while [ ! -f 'screenshot_done_%s.signal' ]; do sleep 1; done && echo 'Screenshot taken. Closing window...' && rm -f 'screenshot_done_%s.signal' && sleep 1 && exit", taskDir, testType, testCmd, testType, testType)
+
+		terminals := [][]string{
+			{"gnome-terminal", "--", "bash", "-c", waitScript},
+			{"xterm", "-e", fmt.Sprintf("bash -c \"%s\"", waitScript)},
+			{"konsole", "-e", fmt.Sprintf("bash -c \"%s\"", waitScript)},
+		}
+
+		var terminalErr error
+		for _, terminal := range terminals {
+			cmd = exec.Command(terminal[0], terminal[1:]...)
+			if _, terminalErr = exec.LookPath(terminal[0]); terminalErr == nil {
+				break
+			}
+		}
+		if terminalErr != nil {
+			return "", fmt.Errorf("no suitable terminal emulator found")
+		}
+
+	default:
+		return "", fmt.Errorf("unsupported operating system: %s", system)
+	}
+
+	// Start the terminal
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("failed to start terminal: %w", err)
+	}
+
+	// Run the actual command to get output
+	var actualCmd *exec.Cmd
+	if testType == "line_coverage" {
+		actualCmd = exec.Command("go", "test", "-coverprofile=coverage.out")
+	} else {
+		actualCmd = exec.Command("gobco")
+	}
+	actualCmd.Dir = taskDir
+
+	startTime := time.Now()
+	output, err := actualCmd.CombinedOutput()
+	testDuration := time.Since(startTime)
+
+	// Wait for command to complete and display
+	displayWait := testDuration + (1 * time.Second)
+	time.Sleep(displayWait)
+
+	// Take screenshot while terminal is still open
+	var screenshotName string
+	if testType == "line_coverage" {
+		screenshotName = "ideal_line_coverage.png"
+	} else {
+		screenshotName = "ideal_branch_coverage.png"
+	}
+
+	fmt.Printf("📸 Taking screenshot for %s...\n", testType)
+	if screenshotErr := takeScreenshot(screenshotName, taskDir); screenshotErr != nil {
+		fmt.Printf("Warning: Could not take screenshot for %s: %v\n", testType, screenshotErr)
+	} else {
+		fmt.Printf("✅ Screenshot saved for %s\n", testType)
+	}
+
+	// Signal terminal to close by creating the signal file
+	if err := os.WriteFile(signalFile, []byte("done"), 0644); err != nil {
+		fmt.Printf("Warning: Could not create signal file for %s: %v\n", testType, err)
+	}
+
+	// Wait a moment for terminal to process the signal and close gracefully
+	time.Sleep(2 * time.Second)
+
+	return string(output), err
 }
 
 // readEnvFile reads the environment file to get TASK_ID
@@ -375,6 +485,27 @@ func generateCombinedHash(responseFile, testFile string) (string, error) {
 	}
 
 	combinedString := responseHash + testHash
+	hasher := sha256.New()
+	hasher.Write([]byte(combinedString))
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// generateMainGoHash generates hash for main.go and main_test.go
+func generateMainGoHash(taskDir string) (string, error) {
+	mainGoFile := filepath.Join(taskDir, "main.go")
+	testFile := filepath.Join(taskDir, "main_test.go")
+
+	mainHash, err := calculateFileHash(mainGoFile)
+	if err != nil {
+		return "", fmt.Errorf("error hashing main.go: %w", err)
+	}
+
+	testHash, err := calculateFileHash(testFile)
+	if err != nil {
+		return "", fmt.Errorf("error hashing main_test.go: %w", err)
+	}
+
+	combinedString := mainHash + testHash
 	hasher := sha256.New()
 	hasher.Write([]byte(combinedString))
 	return hex.EncodeToString(hasher.Sum(nil)), nil
@@ -440,14 +571,62 @@ type TestResult struct {
 	Cached         bool
 }
 
+// MainCoverageResult holds the result of main.go coverage analysis
+type MainCoverageResult struct {
+	LineCoverage   float64
+	BranchCoverage float64
+	CoverageReport string
+	Cached         bool
+}
+
 // runMainCoverageAnalysis runs coverage analysis on main.go if it exists
-func runMainCoverageAnalysis(taskDir string) (float64, float64, string) {
+func runMainCoverageAnalysis(taskDir string) MainCoverageResult {
 	mainGoFile := filepath.Join(taskDir, "main.go")
-	//testFile := filepath.Join(taskDir, "main_test.go")
+	testFile := filepath.Join(taskDir, "main_test.go")
+	cacheFile := filepath.Join(taskDir, "main_coverage.cache")
+	resultFile := filepath.Join(taskDir, "main_coverage_result.txt")
+
+	result := MainCoverageResult{
+		LineCoverage:   0.0,
+		BranchCoverage: 0.0,
+		CoverageReport: "",
+		Cached:         false,
+	}
 
 	// Check if both main.go and main_test.go exist
 	if _, err := os.Stat(mainGoFile); os.IsNotExist(err) {
-		return 0.0, 0.0, "main.go not found - skipping coverage analysis"
+		result.CoverageReport = "main.go not found - skipping coverage analysis"
+		return result
+	}
+
+	if _, err := os.Stat(testFile); os.IsNotExist(err) {
+		result.CoverageReport = "main_test.go not found - skipping coverage analysis"
+		return result
+	}
+
+	// Generate current hash
+	currentHash, err := generateMainGoHash(taskDir)
+	if err != nil {
+		result.CoverageReport = fmt.Sprintf("Failed to generate hash: %v", err)
+		return result
+	}
+
+	// Check if hash matches cached version
+	if cachedHash, err := readHashCache(cacheFile); err == nil && cachedHash == currentHash {
+		// Hash matches, try to load cached result
+		if data, err := os.ReadFile(resultFile); err == nil {
+			result.CoverageReport = string(data)
+			result.Cached = true
+
+			// Parse cached coverage values
+			result.LineCoverage = parseCoverageReport(result.CoverageReport)
+			if branchCov, _ := parseGobcoCoverage(result.CoverageReport); branchCov > 0 {
+				result.BranchCoverage = branchCov
+			}
+
+			fmt.Printf("🚀 main.go coverage - Using cached result (hash match)\n")
+			return result
+		}
 	}
 
 	var coverageOutput strings.Builder
@@ -465,29 +644,23 @@ func runMainCoverageAnalysis(taskDir string) (float64, float64, string) {
 
 	coverageOutput.WriteString("=== Coverage Analysis for main.go ===\n\n")
 
-	// Run line coverage analysis
-	coverageCmd := exec.Command("go", "test", "-coverprofile=coverage.out")
-	coverageCmd.Dir = taskDir
-
-	if cmdOutput, err := coverageCmd.CombinedOutput(); err == nil {
+	// Run line coverage analysis with terminal and screenshot
+	fmt.Printf("📊 Running line coverage analysis for main.go...\n")
+	if lineOutput, err := openTerminalAndRunMainTest(taskDir, "line_coverage"); err == nil {
 		coverageOutput.WriteString("=== Line Coverage Analysis ===\n")
-		coverageOutput.WriteString(string(cmdOutput))
-		lineCoverage = parseCoverageReport(string(cmdOutput))
-
+		coverageOutput.WriteString(lineOutput)
+		lineCoverage = parseCoverageReport(lineOutput)
 	} else {
-		coverageOutput.WriteString(fmt.Sprintf("Line coverage analysis failed: %v\n%s\n", err, string(cmdOutput)))
+		coverageOutput.WriteString(fmt.Sprintf("Line coverage analysis failed: %v\n", err))
 	}
 
-	// Run branch coverage analysis with gobco
-	gobcoCmd := exec.Command("gobco")
-	gobcoCmd.Dir = taskDir
-
-	if gobcoOutput, err := gobcoCmd.CombinedOutput(); err == nil {
+	// Run branch coverage analysis with terminal and screenshot
+	fmt.Printf("📊 Running branch coverage analysis for main.go...\n")
+	if branchOutput, err := openTerminalAndRunMainTest(taskDir, "branch_coverage"); err == nil {
 		coverageOutput.WriteString("\n=== Branch Coverage Analysis (gobco) ===\n")
-		coverageOutput.WriteString(string(gobcoOutput))
+		coverageOutput.WriteString(branchOutput)
 
-		branchCov, coverageReport := parseGobcoCoverage(string(gobcoOutput))
-
+		branchCov, coverageReport := parseGobcoCoverage(branchOutput)
 		branchCoverage = branchCov
 		if coverageReport != "" {
 			coverageOutput.WriteString("\n")
@@ -498,7 +671,20 @@ func runMainCoverageAnalysis(taskDir string) (float64, float64, string) {
 		coverageOutput.WriteString("Note: Make sure 'gobco' is installed: go install github.com/rillig/gobco@latest\n")
 	}
 
-	return lineCoverage, branchCoverage, coverageOutput.String()
+	result.LineCoverage = lineCoverage
+	result.BranchCoverage = branchCoverage
+	result.CoverageReport = coverageOutput.String()
+
+	// Cache the result
+	if err := os.WriteFile(resultFile, []byte(result.CoverageReport), 0644); err != nil {
+		fmt.Printf("Warning: Could not write main coverage result file: %v\n", err)
+	}
+
+	if err := writeHashCache(cacheFile, currentHash); err != nil {
+		fmt.Printf("Warning: Could not write main coverage hash cache: %v\n", err)
+	}
+
+	return result
 }
 
 func parseCoverageReport(output string) float64 {
@@ -601,16 +787,6 @@ func runGoTest(responseFile, testFile, workDir, taskDir string) TestResult {
 		return result
 	}
 
-	// Take screenshot after test completes
-	fmt.Printf("📸 Taking screenshot for %s...\n", responseName)
-	if err := takeScreenshot(responseName, responseFolder, taskDir); err != nil {
-		fmt.Printf("Warning: Could not take screenshot for %s: %v\n", responseName, err)
-	} else {
-		fmt.Printf("✅ Screenshot saved for %s\n", responseName)
-		// Signal terminal to close
-		signalFile := filepath.Join(taskDir, fmt.Sprintf("screenshot_done_%s.signal", responseName))
-		os.WriteFile(signalFile, []byte("done"), 0644)
-	}
 	// Write individual result.txt file
 	resultFile := filepath.Join(responseFolder, "result.txt")
 	if err := os.WriteFile(resultFile, []byte(result.Output), 0644); err != nil {
@@ -626,7 +802,7 @@ func runGoTest(responseFile, testFile, workDir, taskDir string) TestResult {
 }
 
 // writeResults writes all test results to a file
-func writeResults(resultsFile string, taskID string, results []TestResult, mainLineCoverage, mainBranchCoverage float64, mainCoverageReport string) error {
+func writeResults(resultsFile string, taskID string, results []TestResult, mainCoverage MainCoverageResult) error {
 	file, err := os.Create(resultsFile)
 	if err != nil {
 		return fmt.Errorf("error creating results file: %w", err)
@@ -652,15 +828,19 @@ func writeResults(resultsFile string, taskID string, results []TestResult, mainL
 	fmt.Fprintf(writer, "Summary: %d/%d tests passed (%d cached)\n\n", passedCount, len(results), cachedCount)
 
 	// Add main.go coverage analysis if available
-	if mainLineCoverage > 0 || mainBranchCoverage > 0 || mainCoverageReport != "" {
+	if mainCoverage.LineCoverage > 0 || mainCoverage.BranchCoverage > 0 || mainCoverage.CoverageReport != "" {
 		fmt.Fprintf(writer, "%s\n", strings.Repeat("=", 60))
-		fmt.Fprintf(writer, "MAIN.GO COVERAGE ANALYSIS\n")
-		fmt.Fprintf(writer, "%s\n", strings.Repeat("=", 60))
-		if mainLineCoverage > 0 || mainBranchCoverage > 0 {
-			fmt.Fprintf(writer, "Line Coverage: %.1f%%\n", mainLineCoverage)
-			fmt.Fprintf(writer, "Branch Coverage: %.1f%%\n", mainBranchCoverage)
+		fmt.Fprintf(writer, "MAIN.GO COVERAGE ANALYSIS")
+		if mainCoverage.Cached {
+			fmt.Fprintf(writer, " (CACHED)")
 		}
-		fmt.Fprintf(writer, "\n%s\n\n", mainCoverageReport)
+		fmt.Fprintf(writer, "\n")
+		fmt.Fprintf(writer, "%s\n", strings.Repeat("=", 60))
+		if mainCoverage.LineCoverage > 0 || mainCoverage.BranchCoverage > 0 {
+			fmt.Fprintf(writer, "Line Coverage: %.1f%%\n", mainCoverage.LineCoverage)
+			fmt.Fprintf(writer, "Branch Coverage: %.1f%%\n", mainCoverage.BranchCoverage)
+		}
+		fmt.Fprintf(writer, "\n%s\n\n", mainCoverage.CoverageReport)
 	}
 
 	for _, result := range results {
@@ -735,10 +915,13 @@ func main() {
 	cachedCount := 0
 
 	// Run coverage analysis on main.go if it exists (separate from individual response tests)
-	mainLineCoverage, mainBranchCoverage, mainCoverageReport := runMainCoverageAnalysis(taskDir)
+	mainCoverage := runMainCoverageAnalysis(taskDir)
 
-	fmt.Printf("Main line coverage: %.1f%%\n", mainLineCoverage)
-	fmt.Printf("Main branch coverage: %.1f%%\n", mainBranchCoverage)
+	fmt.Printf("Main line coverage: %.1f%%\n", mainCoverage.LineCoverage)
+	fmt.Printf("Main branch coverage: %.1f%%\n", mainCoverage.BranchCoverage)
+	if mainCoverage.Cached {
+		fmt.Printf("Main coverage analysis: CACHED\n")
+	}
 
 	// Test each response
 	for _, pair := range responsePairs {
@@ -769,7 +952,7 @@ func main() {
 
 	// Write results to file
 	resultsFile := filepath.Join(taskDir, "result.txt")
-	if err := writeResults(resultsFile, taskID, results, mainLineCoverage, mainBranchCoverage, mainCoverageReport); err != nil {
+	if err := writeResults(resultsFile, taskID, results, mainCoverage); err != nil {
 		fmt.Printf("Error writing results: %v\n", err)
 	}
 
@@ -784,10 +967,13 @@ func main() {
 	}
 
 	// Display main.go coverage if available
-	if mainLineCoverage > 0 || mainBranchCoverage > 0 {
+	if mainCoverage.LineCoverage > 0 || mainCoverage.BranchCoverage > 0 {
 		fmt.Printf("\nMAIN.GO COVERAGE:\n")
-		fmt.Printf("Line Coverage: %.1f%%\n", mainLineCoverage)
-		fmt.Printf("Branch Coverage: %.1f%%\n", mainBranchCoverage)
+		fmt.Printf("Line Coverage: %.1f%%\n", mainCoverage.LineCoverage)
+		fmt.Printf("Branch Coverage: %.1f%%\n", mainCoverage.BranchCoverage)
+		if mainCoverage.Cached {
+			fmt.Printf("Coverage Analysis: CACHED\n")
+		}
 	}
 
 	absResultsPath, _ := filepath.Abs(resultsFile)
