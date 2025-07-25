@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -129,7 +130,27 @@ func takeScreenshot(screenshotName, taskDir string) error {
 	return cmd.Run()
 }
 
-// openTerminalAndRunTest opens a terminal and runs the test
+// killProcessTree kills a process and its children
+func killProcessTree(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+
+	system := runtime.GOOS
+	switch system {
+	case "windows":
+		// Kill process tree on Windows
+		killCmd := exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid))
+		killCmd.Run()
+	case "darwin", "linux":
+		// Kill process group on Unix-like systems
+		if cmd.Process != nil {
+			//syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}
+}
+
+// openTerminalAndRunTest opens a terminal and runs the test with timeout
 func openTerminalAndRunTest(responseFile, testFile, workDir, responseName string) (TestResult, error) {
 	system := runtime.GOOS
 
@@ -256,19 +277,59 @@ end tell
 		return result, fmt.Errorf("failed to start terminal: %w", err)
 	}
 
-	// Run test separately to get result and timing
+	// Run test separately with timeout
 	testCmdExec := exec.Command("go", "test", "-v",
 		filepath.Base(testFile),
 		"temp_"+filepath.Base(responseFile))
 	testCmdExec.Dir = workDir
 
-	startTime := time.Now()
-	output, testErr := testCmdExec.CombinedOutput()
-	testDuration := time.Since(startTime)
+	// Set up process group for proper cleanup on Unix systems
+	if system != "windows" {
+		//testCmdExec.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 
-	// Wait for test to complete and display (test time + small buffer for display)
-	displayWait := testDuration + (1 * time.Second)
-	time.Sleep(displayWait)
+	// Create a context with 10-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	startTime := time.Now()
+	var output []byte
+	var testErr error
+	timedOut := false
+
+	// Run the test command with timeout
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		output, testErr = testCmdExec.CombinedOutput()
+	}()
+
+	select {
+	case <-done:
+		// Test completed within timeout
+		testDuration := time.Since(startTime)
+		fmt.Printf("⏱️  Test completed in %.2f seconds\n", testDuration.Seconds())
+
+		// Wait for test to display (test time + small buffer for display)
+		displayWait := testDuration + (1 * time.Second)
+		time.Sleep(displayWait)
+
+	case <-ctx.Done():
+		// Test timed out
+		timedOut = true
+		fmt.Printf("⏰ Test timed out after 10 seconds, killing process...\n")
+
+		// Kill the test process
+		if testCmdExec.Process != nil {
+			killProcessTree(testCmdExec)
+		}
+
+		// Wait a bit for the terminal to show the timeout
+		time.Sleep(2 * time.Second)
+
+		output = []byte("Test timed out after 10 seconds")
+		testErr = fmt.Errorf("test execution timed out")
+	}
 
 	// Take screenshot while terminal is still open
 	fmt.Printf("📸 Taking screenshot for %s...\n", responseName)
@@ -287,8 +348,12 @@ end tell
 	// Wait a moment for terminal to process the signal and close gracefully
 	time.Sleep(2 * time.Second)
 
+	// Prepare result output
 	result.Output = fmt.Sprintf("=== Test Output ===\n%s\n", string(output))
-	if testErr == nil {
+	if timedOut {
+		result.Output += "\n⏰ TEST TIMED OUT AFTER 10 SECONDS\n"
+		result.Success = false
+	} else if testErr == nil {
 		result.Success = true
 	} else {
 		result.Output += fmt.Sprintf("\nTest Error: %v\n", testErr)
@@ -297,7 +362,7 @@ end tell
 	return result, nil
 }
 
-// openTerminalAndRunMainTest opens a terminal and runs coverage analysis for main.go
+// openTerminalAndRunMainTest opens a terminal and runs coverage analysis for main.go with timeout
 func openTerminalAndRunMainTest(taskDir, testType string) (string, error) {
 	system := runtime.GOOS
 	signalFile := filepath.Join(taskDir, fmt.Sprintf("screenshot_done_%s.signal", testType))
@@ -389,7 +454,7 @@ end tell
 		return "", fmt.Errorf("failed to start terminal: %w", err)
 	}
 
-	// Run the actual command to get output
+	// Run the actual command with timeout
 	var actualCmd *exec.Cmd
 	if testType == "line_coverage" {
 		actualCmd = exec.Command("go", "test", "-coverprofile=coverage.out")
@@ -398,13 +463,53 @@ end tell
 	}
 	actualCmd.Dir = taskDir
 
-	startTime := time.Now()
-	output, err := actualCmd.CombinedOutput()
-	testDuration := time.Since(startTime)
+	// Set up process group for proper cleanup on Unix systems
+	if system != "windows" {
+		//actualCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 
-	// Wait for command to complete and display
-	displayWait := testDuration + (1 * time.Second)
-	time.Sleep(displayWait)
+	// Create a context with 10-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	startTime := time.Now()
+	var output []byte
+	var err error
+	timedOut := false
+
+	// Run the command with timeout
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		output, err = actualCmd.CombinedOutput()
+	}()
+
+	select {
+	case <-done:
+		// Command completed within timeout
+		testDuration := time.Since(startTime)
+		fmt.Printf("⏱️  Coverage analysis completed in %.2f seconds\n", testDuration.Seconds())
+
+		// Wait for command to complete and display
+		displayWait := testDuration + (1 * time.Second)
+		time.Sleep(displayWait)
+
+	case <-ctx.Done():
+		// Command timed out
+		timedOut = true
+		fmt.Printf("⏰ Coverage analysis timed out after 10 seconds, killing process...\n")
+
+		// Kill the process
+		if actualCmd.Process != nil {
+			killProcessTree(actualCmd)
+		}
+
+		// Wait a bit for the terminal to show the timeout
+		time.Sleep(2 * time.Second)
+
+		output = []byte("Coverage analysis timed out after 10 seconds")
+		err = fmt.Errorf("coverage analysis execution timed out")
+	}
 
 	// Take screenshot while terminal is still open
 	var screenshotName string
@@ -429,7 +534,12 @@ end tell
 	// Wait a moment for terminal to process the signal and close gracefully
 	time.Sleep(2 * time.Second)
 
-	return string(output), err
+	result := string(output)
+	if timedOut {
+		result += "\n⏰ COVERAGE ANALYSIS TIMED OUT AFTER 10 SECONDS\n"
+	}
+
+	return result, err
 }
 
 // readEnvFile reads the environment file to get TASK_ID
@@ -814,6 +924,7 @@ func writeResults(resultsFile string, taskID string, results []TestResult, mainC
 
 	passedCount := 0
 	cachedCount := 0
+	timedOutCount := 0
 	for _, result := range results {
 		if result.Success {
 			passedCount++
@@ -821,11 +932,18 @@ func writeResults(resultsFile string, taskID string, results []TestResult, mainC
 		if result.Cached {
 			cachedCount++
 		}
+		if strings.Contains(result.Output, "TIMED OUT") {
+			timedOutCount++
+		}
 	}
 
 	fmt.Fprintf(writer, "Go Test Results for Task %s\n", taskID)
 	fmt.Fprintf(writer, "%s\n\n", strings.Repeat("=", 60))
-	fmt.Fprintf(writer, "Summary: %d/%d tests passed (%d cached)\n\n", passedCount, len(results), cachedCount)
+	fmt.Fprintf(writer, "Summary: %d/%d tests passed (%d cached", passedCount, len(results), cachedCount)
+	if timedOutCount > 0 {
+		fmt.Fprintf(writer, ", %d timed out", timedOutCount)
+	}
+	fmt.Fprintf(writer, ")\n\n")
 
 	// Add main.go coverage analysis if available
 	if mainCoverage.LineCoverage > 0 || mainCoverage.BranchCoverage > 0 || mainCoverage.CoverageReport != "" {
@@ -848,6 +966,9 @@ func writeResults(resultsFile string, taskID string, results []TestResult, mainC
 		fmt.Fprintf(writer, "Test: %s", result.Name)
 		if result.Cached {
 			fmt.Fprintf(writer, " (CACHED)")
+		}
+		if strings.Contains(result.Output, "TIMED OUT") {
+			fmt.Fprintf(writer, " (TIMED OUT)")
 		}
 		fmt.Fprintf(writer, "\n")
 		if result.Success {
@@ -913,6 +1034,7 @@ func main() {
 	var results []TestResult
 	passedCount := 0
 	cachedCount := 0
+	timedOutCount := 0
 
 	// Run coverage analysis on main.go if it exists (separate from individual response tests)
 	mainCoverage := runMainCoverageAnalysis(taskDir)
@@ -936,6 +1058,12 @@ func main() {
 		result := runGoTest(responseFile, testFile, taskDir, taskDir)
 		results = append(results, result)
 
+		// Check for timeout
+		isTimedOut := strings.Contains(result.Output, "TIMED OUT")
+		if isTimedOut {
+			timedOutCount++
+		}
+
 		if result.Success {
 			passedCount++
 			if result.Cached {
@@ -946,7 +1074,11 @@ func main() {
 				sendNotification("Go Test Passed! 🎉", fmt.Sprintf("%s passed all tests!", responseName))
 			}
 		} else {
-			fmt.Printf("❌ %s FAILED\n", responseName)
+			if isTimedOut {
+				fmt.Printf("⏰ %s TIMED OUT (failed)\n", responseName)
+			} else {
+				fmt.Printf("❌ %s FAILED\n", responseName)
+			}
 		}
 	}
 
@@ -965,6 +1097,9 @@ func main() {
 	if cachedCount > 0 {
 		fmt.Printf("Cached: %d\n", cachedCount)
 	}
+	if timedOutCount > 0 {
+		fmt.Printf("Timed out: %d\n", timedOutCount)
+	}
 
 	// Display main.go coverage if available
 	if mainCoverage.LineCoverage > 0 || mainCoverage.BranchCoverage > 0 {
@@ -980,10 +1115,13 @@ func main() {
 	fmt.Printf("\nResults written to: %s\n", absResultsPath)
 
 	if passedCount > 0 {
-		sendNotification(
-			"Testing Complete! 🏆",
-			fmt.Sprintf("%d/%d tests passed for Task %s", passedCount, len(results), taskID),
-		)
+		var message string
+		if timedOutCount > 0 {
+			message = fmt.Sprintf("%d/%d tests passed (%d timed out) for Task %s", passedCount, len(results), timedOutCount, taskID)
+		} else {
+			message = fmt.Sprintf("%d/%d tests passed for Task %s", passedCount, len(results), taskID)
+		}
+		sendNotification("Testing Complete! 🏆", message)
 	}
 
 	// Final cleanup: Remove all signal files
