@@ -209,6 +209,7 @@ func openTerminalAndRunTest(responseFile, testFile, workDir, responseName string
 	case "windows":
 		// Create a batch file that waits for screenshot signal
 		batchContent := fmt.Sprintf(`@echo off
+title BCB_%s
 cd /d "%s"
 echo Testing %s...
 echo.
@@ -226,7 +227,7 @@ if exist "screenshot_done_%s.signal" (
     timeout /t 1 /nobreak > nul
     goto wait
 )
-`, workDir, responseName, testCmd, responseName, responseName)
+`, responseName, workDir, responseName, testCmd, responseName, responseName)
 
 		batchFile := filepath.Join(workDir, fmt.Sprintf("test_%s.bat", responseName))
 		if err := os.WriteFile(batchFile, []byte(batchContent), 0644); err != nil {
@@ -863,6 +864,23 @@ func loadCachedResult(responseFolder string) (TestResult, error) {
 	}, nil
 }
 
+func renameResponse(oldName string) (string, error) {
+	re := regexp.MustCompile(`^response(\d+)$`)
+	matches := re.FindStringSubmatch(oldName)
+	if len(matches) != 2 {
+		return "", fmt.Errorf("invalid format: %s", oldName)
+	}
+	num, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return "", err
+	}
+	if num < 1 || num > 26 {
+		return "", fmt.Errorf("only supports 1-26")
+	}
+	newSuffix := string(rune('A' + num - 1))
+	return "response_" + newSuffix, nil
+}
+
 // runGoTest runs go test for a specific response file
 func runGoTest(responseFile, testFile, workDir, taskDir string) TestResult {
 	responseFolder := filepath.Dir(responseFile)
@@ -890,8 +908,13 @@ func runGoTest(responseFile, testFile, workDir, taskDir string) TestResult {
 		}
 	}
 
+	renamedResponseName, err := renameResponse(responseName)
+	if err != nil {
+		fmt.Printf("Cannot rename reponse; using old name %s: %v\n", responseName, err)
+		renamedResponseName = responseName
+	}
 	// Open terminal and run test
-	result, err := openTerminalAndRunTest(responseFile, testFile, workDir, responseName)
+	result, err := openTerminalAndRunTest(responseFile, testFile, workDir, renamedResponseName)
 	if err != nil {
 		result.Output = fmt.Sprintf("Failed to run test in terminal: %v", err)
 		return result
@@ -984,6 +1007,98 @@ func writeResults(resultsFile string, taskID string, results []TestResult, mainC
 	return nil
 }
 
+func killProcessesByTitlePrefix(prefix string) error {
+	// build a PowerShell one‑liner
+	psCmd := fmt.Sprintf(
+		"Get-Process cmd, powershell, pwsh, WindowsTerminal | "+
+			"Where-Object {$_.MainWindowTitle -like '%s_response_[A-Z]'} | "+
+			"Stop-Process -Force",
+		prefix,
+	)
+
+	// run it and capture output
+	out, err := exec.Command("powershell", "-NoProfile", "-Command", psCmd).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("PowerShell error: %v\n%s", err, out)
+	}
+
+	fmt.Printf("✅ Killed any windows matching %s_response_[A-Z]\n", prefix)
+	return nil
+}
+
+// cleanupKillFiles finds and kills processes from .kill files
+func cleanupKillFiles(taskDir string) {
+	fmt.Printf("\n🧹 Cleaning up PID files and hanging processes...\n")
+
+	killPattern := filepath.Join(taskDir, "*.kill")
+	matches, err := filepath.Glob(killPattern)
+	if err != nil {
+		fmt.Printf("Error finding kill files: %v\n", err)
+		return
+	}
+
+	if len(matches) == 0 {
+		fmt.Printf("No kill files found\n")
+		return
+	}
+
+	for _, killFile := range matches {
+		fmt.Printf("Processing kill file: %s\n", filepath.Base(killFile))
+
+		// Extract PID from filename (format: PID.kill)
+		baseName := filepath.Base(killFile)
+		pidStr := strings.TrimSuffix(baseName, ".kill")
+
+		pid, err := strconv.Atoi(pidStr)
+		if err != nil {
+			fmt.Printf("❌ Invalid PID in filename %s: %v\n", baseName, err)
+			os.Remove(killFile)
+			continue
+		}
+
+		// Try to kill the process
+		fmt.Printf("🔪 Attempting to kill PID: %d\n", pid)
+
+		killCmd := exec.Command("taskkill", "/F", "/T", "/PID", pidStr)
+		if err := killCmd.Run(); err != nil {
+			fmt.Printf("⚠️  Process PID %d may already be terminated: %v\n", pid, err)
+		} else {
+			fmt.Printf("✅ Successfully killed PID %d\n", pid)
+		}
+
+		// Remove the kill file
+		if err := os.Remove(killFile); err != nil {
+			fmt.Printf("⚠️  Failed to remove kill file %s: %v\n", killFile, err)
+		} else {
+			fmt.Printf("🗑️  Removed kill file: %s\n", baseName)
+		}
+	}
+}
+
+func cleanupTempFiles(taskDir string) {
+	fmt.Printf("\n🧹 Cleaning up temporary files...\n")
+
+	// Clean up .bat files
+	batPattern := filepath.Join(taskDir, "*.bat")
+	if matches, err := filepath.Glob(batPattern); err == nil {
+		for _, match := range matches {
+			if err := os.Remove(match); err == nil {
+				fmt.Printf("   Removed .bat file: %s\n", filepath.Base(match))
+			}
+		}
+	}
+
+	// Clean up temp_ files
+	tempPattern := filepath.Join(taskDir, "temp_*")
+	if matches, err := filepath.Glob(tempPattern); err == nil {
+		for _, match := range matches {
+			if err := os.Remove(match); err == nil {
+				fmt.Printf("   Removed temp file: %s\n", filepath.Base(match))
+			}
+		}
+	}
+}
+
 func main() {
 	// Read environment file
 	taskID, err := readEnvFile("env")
@@ -1002,6 +1117,8 @@ func main() {
 	fmt.Printf("Working with task ID: %s\n", taskID)
 	absPath, _ := filepath.Abs(taskDir)
 	fmt.Printf("Task directory: %s\n", absPath)
+
+	cleanupTempFiles(taskDir)
 
 	// Find main_test.go
 	testFile := filepath.Join(taskDir, "main_test.go")
@@ -1134,4 +1251,6 @@ func main() {
 			}
 		}
 	}
+
+	killProcessesByTitlePrefix("BCB")
 }
