@@ -1,20 +1,26 @@
 package main
 
 import (
+	"baliance.com/gooxml/common"
+	"baliance.com/gooxml/measurement"
 	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"baliance.com/gooxml/document"
 )
 
 // sendNotification sends a cross-platform notification
@@ -1010,7 +1016,7 @@ func writeResults(resultsFile string, taskID string, results []TestResult, mainC
 func killProcessesByTitlePrefix(prefix string) error {
 	// build a PowerShell one‑liner
 	psCmd := fmt.Sprintf(
-		"Get-Process cmd, powershell, pwsh, WindowsTerminal | "+
+		"Get-Process cmd, powershell, pwsh, WindowsTerminal -ErrorAction SilentlyContinue | "+
 			"Where-Object {$_.MainWindowTitle -like '%s_response_[A-Z]'} | "+
 			"Stop-Process -Force",
 		prefix,
@@ -1097,6 +1103,69 @@ func cleanupTempFiles(taskDir string) {
 			}
 		}
 	}
+}
+
+func humanize(filename string) string {
+	name := strings.TrimSuffix(filename, filepath.Ext(filename))
+	parts := strings.Split(name, "_")
+	for i, p := range parts {
+		parts[i] = strings.Title(p)
+	}
+	return strings.Join(parts, " ")
+}
+
+// generateDocxFromImages scans folder, builds a .docx, and returns the output filename.
+
+func generateDocxFromImages(folder string) (string, error) {
+	fmt.Println("Start generating docx from images")
+	files, err := ioutil.ReadDir(folder)
+	if err != nil {
+		return "", fmt.Errorf("cannot read folder %q: %v", folder, err)
+	}
+
+	doc := document.New()
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(strings.ToLower(f.Name()), ".png") {
+			continue
+		}
+
+		// Title
+		title := strings.TrimSuffix(f.Name(), filepath.Ext(f.Name()))
+		p := doc.AddParagraph()
+		p.Properties().SetStyle("Heading1")
+		p.AddRun().AddText(humanize(title))
+
+		// Load image
+		imgPath := filepath.Join(folder, f.Name())
+		img, err := common.ImageFromFile(imgPath)
+		if err != nil {
+			return "", fmt.Errorf("cannot load image %q: %v", imgPath, err)
+		}
+		imgRef, err := doc.AddImage(img)
+		if err != nil {
+			return "", fmt.Errorf("cannot add image to doc: %v", err)
+		}
+
+		// Inline + resize to max 6" wide, keep aspect ratio
+		run := doc.AddParagraph().AddRun()
+		inline, err := run.AddDrawingInline(imgRef)
+		if err != nil {
+			return "", fmt.Errorf("cannot inline image: %v", err)
+		}
+		maxW := 6 * measurement.Inch
+		h := imgRef.RelativeHeight(measurement.Distance(maxW)) // compute height for 6" width :contentReference[oaicite:0]{index=0}
+		inline.SetSize(measurement.Distance(maxW), h)          // set the displayed size :contentReference[oaicite:1]{index=1}
+
+		// blank lines
+		doc.AddParagraph()
+		doc.AddParagraph()
+	}
+
+	out := fmt.Sprintf("images_%s.docx", time.Now().Format("20060102_150405"))
+	if err := doc.SaveToFile(filepath.Join(folder, out)); err != nil {
+		return "", fmt.Errorf("cannot save document: %v", err)
+	}
+	return out, nil
 }
 
 func main() {
@@ -1242,7 +1311,7 @@ func main() {
 	}
 
 	// Final cleanup: Remove all signal files
-	fmt.Printf("\n🧹 Final cleanup of signal files...\n")
+	fmt.Printf("\n🧹 Cleanup of signal files...\n")
 	signalPattern := filepath.Join(taskDir, "screenshot_done_*.signal")
 	if matches, err := filepath.Glob(signalPattern); err == nil {
 		for _, match := range matches {
@@ -1252,5 +1321,15 @@ func main() {
 		}
 	}
 
-	killProcessesByTitlePrefix("BCB")
+	fmt.Printf("\n🧹 Cleanup hanging processes...\n")
+	err = killProcessesByTitlePrefix("BCB")
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	fmt.Printf("\n🧹 Generating docs...\n")
+	_, err = generateDocxFromImages(path.Join(taskDir, "pictures"))
+	if err != nil {
+		fmt.Println(err)
+	}
 }
